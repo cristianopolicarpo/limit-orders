@@ -22,20 +22,19 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
     using CurrencyLibrary for Currency;
     using FixedPointMathLib for uint256;
 
-    // Storage
-    mapping(PoolId poolId => int24 lastTick) public lastTicks;
-    mapping(PoolId poolId => mapping(int24 tickToSellAt => mapping(bool zeroForOne => uint256 inputAmount)))
-        public pendingOrders;
-
-    mapping(uint256 positionId => uint256 outputClaimable)
-        public claimableOutputTokens;
-    mapping(uint256 positionId => uint256 claimsSupply)
-        public claimTokensSupply;
-
     // Errors
     error InvalidOrder();
     error NothingToClaim();
     error NotEnoughToClaim();
+
+    mapping(PoolId poolId => mapping(int24 tickToSellAt => mapping(bool zeroForOne => uint256 inputAmount)))
+        public pendingOrders;
+
+    mapping(uint256 positionId => uint256 claimsSupply)
+        public claimTokensSupply;
+
+    mapping(uint256 positionId => uint256 outputClaimable)
+        public claimableOutputTokens;
 
     // Constructor
     constructor(
@@ -72,7 +71,7 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
         int24 tick,
         bytes calldata
     ) external override poolManagerOnly returns (bytes4) {
-        lastTicks[key.toId()] = tick;
+        // TODO
         return this.afterInitialize.selector;
     }
 
@@ -83,23 +82,37 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
         BalanceDelta,
         bytes calldata
     ) external override poolManagerOnly returns (bytes4) {
-        if (sender == address(this)) return this.afterSwap.selector;
-
-        bool tryMore = true;
-        int24 currentTick;
-
-        while (tryMore) {
-            (tryMore, currentTick) = tryExecutingOrders(
-                key,
-                !params.zeroForOne
-            );
-            lastTicks[key.toId()] = currentTick;
-        }
-
+        // TODO
         return this.afterSwap.selector;
     }
 
-    // Core Hook External Functions
+    function getLowerUsableTick(
+        int24 tick,
+        int24 tickSpacing
+    ) private pure returns (int24) {
+        // E.g. tickSpacing = 60, tick = -100
+        // closest usable tick rounded-down will be -120
+
+        // intervals = -100/60 = -1 (integer division)
+        int24 intervals = tick / tickSpacing;
+
+        // since tick < 0, we round `intervals` down to -2
+        // if tick > 0, `intervals` is fine as it is
+        if (tick < 0 && tick % tickSpacing != 0) intervals--; // round towards negative infinity
+
+        // actual usable tick, then, is intervals * tickSpacing
+        // i.e. -2 * 60 = -120
+        return intervals * tickSpacing;
+    }
+
+    function getPositionId(
+        PoolKey calldata key,
+        int24 tick,
+        bool zeroForOne
+    ) public pure returns (uint256) {
+        return uint256(keccak256(abi.encode(key.toId(), tick, zeroForOne)));
+    }
+
     function placeOrder(
         PoolKey calldata key,
         int24 tickToSellAt,
@@ -191,89 +204,6 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
         token.transfer(msg.sender, outputAmount);
     }
 
-    // Internal Functions
-    function tryExecutingOrders(
-        PoolKey calldata key,
-        bool executeZeroForOne
-    ) internal returns (bool tryMore, int24 newTick) {
-        (, int24 currentTick, , ) = poolManager.getSlot0(key.toId());
-        int24 lastTick = lastTicks[key.toId()];
-
-        // Tick has increased i.e. people sold Token 0 to buy Token 1
-        // i.e. Token 1 price has increased
-        // We should check if we have any orders looking to sell Token 1
-        // at ticks `lastTick` to `currentTick`
-        if (lastTick < currentTick) {
-            for (
-                int24 tick = lastTick;
-                tick < currentTick;
-                tick += key.tickSpacing
-            ) {
-                uint256 inputAmount = pendingOrders[key.toId()][tick][
-                    executeZeroForOne
-                ];
-                if (inputAmount > 0) {
-                    executeOrder(key, tick, executeZeroForOne, inputAmount);
-                    (, currentTick, , ) = poolManager.getSlot0(key.toId());
-                    return (true, currentTick);
-                }
-            }
-        }
-        // Tick has gone down i.e. people bought Token 0 and sold Token 1
-        // i.e. Token 0 price has increased
-        // We should check if we have any orders looking to sell Token 0
-        // at ticks `currentTick` to `lastTick`
-        else {
-            for (
-                int24 tick = lastTick;
-                tick > currentTick;
-                tick -= key.tickSpacing
-            ) {
-                uint256 inputAmount = pendingOrders[key.toId()][tick][
-                    executeZeroForOne
-                ];
-                if (inputAmount > 0) {
-                    executeOrder(key, tick, executeZeroForOne, inputAmount);
-                    (, currentTick, , ) = poolManager.getSlot0(key.toId());
-                    return (true, currentTick);
-                }
-            }
-        }
-
-        return (false, currentTick);
-    }
-
-    function executeOrder(
-        PoolKey calldata key,
-        int24 tick,
-        bool zeroForOne,
-        uint256 inputAmount
-    ) internal {
-        // Do the actual swap and settle all balances
-        BalanceDelta delta = swapAndSettleBalances(
-            key,
-            IPoolManager.SwapParams({
-                zeroForOne: zeroForOne,
-                // We provide a negative value here to signify an "exact input for output" swap
-                amountSpecified: -int256(inputAmount),
-                // No slippage limits (maximum slippage possible)
-                sqrtPriceLimitX96: zeroForOne
-                    ? TickMath.MIN_SQRT_RATIO + 1
-                    : TickMath.MAX_SQRT_RATIO - 1
-            })
-        );
-
-        // `inputAmount` has been deducted from this position
-        pendingOrders[key.toId()][tick][zeroForOne] -= inputAmount;
-        uint256 positionId = getPositionId(key, tick, zeroForOne);
-        uint256 outputAmount = zeroForOne
-            ? uint256(int256(delta.amount1()))
-            : uint256(int256(delta.amount0()));
-
-        // `outputAmount` worth of tokens now can be claimed/redeemed by position holders
-        claimableOutputTokens[positionId] += outputAmount;
-    }
-
     function swapAndSettleBalances(
         PoolKey calldata key,
         IPoolManager.SwapParams memory params
@@ -319,31 +249,35 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
         poolManager.take(currency, address(this), amount);
     }
 
-    // Helper Functions
-    function getPositionId(
+    function executeOrder(
         PoolKey calldata key,
         int24 tick,
-        bool zeroForOne
-    ) public pure returns (uint256) {
-        return uint256(keccak256(abi.encode(key.toId(), tick, zeroForOne)));
-    }
+        bool zeroForOne,
+        uint256 inputAmount
+    ) internal {
+        // Do the actual swap and settle all balances
+        BalanceDelta delta = swapAndSettleBalances(
+            key,
+            IPoolManager.SwapParams({
+                zeroForOne: zeroForOne,
+                // We provide a negative value here to signify
+                // an "exact input for output" swap
+                amountSpecified: -int256(inputAmount),
+                // No slippage limits (maximum slippage possible)
+                sqrtPriceLimitX96: zeroForOne
+                    ? TickMath.MIN_SQRT_RATIO + 1
+                    : TickMath.MAX_SQRT_RATIO - 1
+            })
+        );
 
-    function getLowerUsableTick(
-        int24 tick,
-        int24 tickSpacing
-    ) private pure returns (int24) {
-        // E.g. tickSpacing = 60, tick = -100
-        // closest usable tick rounded-down will be -120
+        // `inputAmount` has been deducted from this position
+        pendingOrders[key.toId()][tick][zeroForOne] -= inputAmount;
+        uint256 positionId = getPositionId(key, tick, zeroForOne);
+        uint256 outputAmount = zeroForOne
+            ? uint256(int256(delta.amount1()))
+            : uint256(int256(delta.amount0()));
 
-        // intervals = -100/60 = -1 (integer division)
-        int24 intervals = tick / tickSpacing;
-
-        // since tick < 0, we round `intervals` down to -2
-        // if tick > 0, `intervals` is fine as it is
-        if (tick < 0 && tick % tickSpacing != 0) intervals--; // round towards negative infinity
-
-        // actual usable tick, then, is intervals * tickSpacing
-        // i.e. -2 * 60 = -120
-        return intervals * tickSpacing;
+        // `outputAmount` worth of tokens now can be claimed/redeemed by position holders
+        claimableOutputTokens[positionId] += outputAmount;
     }
 }
